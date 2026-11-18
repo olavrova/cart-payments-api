@@ -1,13 +1,17 @@
+import uuid
 from decimal import Decimal
 
 import pytest
 
-from app.payment_provider import MockPaymentProvider, PaymentProviderError
+from app.payment_provider import ChargeResult, MockPaymentProvider, PaymentProviderError
 
 
-def charge(token: str):
-    return MockPaymentProvider().charge(
-        token=token, amount=Decimal("10.00"), currency="USD", idempotency_key="key"
+def charge(token: str, provider=None, idempotency_key=None):
+    return (provider or MockPaymentProvider()).charge(
+        token=token,
+        amount=Decimal("10.00"),
+        currency="USD",
+        idempotency_key=idempotency_key or str(uuid.uuid4()),
     )
 
 
@@ -19,8 +23,21 @@ def test_charge_succeeds_with_a_regular_token():
     assert result.failure_reason is None
 
 
-def test_each_success_has_its_own_provider_payment_id():
-    assert charge("tok_a").provider_payment_id != charge("tok_a").provider_payment_id
+def test_each_charge_has_its_own_provider_payment_id():
+    provider = MockPaymentProvider()
+
+    assert charge("tok_a", provider).provider_payment_id != (
+        charge("tok_a", provider).provider_payment_id
+    )
+
+
+def test_same_idempotency_key_returns_the_first_answer_without_charging_again():
+    provider = MockPaymentProvider()
+
+    first = charge("tok_a", provider, idempotency_key="payment-1")
+    again = charge("tok_a", provider, idempotency_key="payment-1")
+
+    assert again == first
 
 
 def test_charge_is_declined_when_token_contains_decline():
@@ -34,3 +51,25 @@ def test_charge_is_declined_when_token_contains_decline():
 def test_charge_raises_when_token_contains_error():
     with pytest.raises(PaymentProviderError):
         charge("tok_error_visa")
+
+
+def test_provider_error_is_not_remembered_so_a_retry_can_succeed():
+    provider = MockPaymentProvider()
+    with pytest.raises(PaymentProviderError):
+        charge("tok_error_visa", provider, idempotency_key="payment-1")
+
+    assert charge("tok_ok", provider, idempotency_key="payment-1").succeeded
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"succeeded": True},
+        {"succeeded": True, "provider_payment_id": ""},
+        {"succeeded": False},
+        {"succeeded": False, "failure_reason": ""},
+    ],
+)
+def test_charge_result_without_its_required_field_is_rejected(fields):
+    with pytest.raises(ValueError):
+        ChargeResult(**fields)
