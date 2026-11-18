@@ -5,7 +5,7 @@ import uuid
 from datetime import timedelta
 
 from sqlalchemy import func, select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.cart_total import calculate_cart_total
 from app.errors import (
@@ -16,7 +16,7 @@ from app.errors import (
     PaymentInProgress,
     PaymentMethodNotFound,
 )
-from app.models import Cart, CartStatus, Payment, PaymentMethod, PaymentStatus
+from app.models import Cart, CartItem, CartStatus, Payment, PaymentMethod, PaymentStatus
 from app.payment_provider import PaymentProvider, PaymentProviderError
 
 # Far longer than a provider call takes. A payment still pending this long after its
@@ -94,6 +94,7 @@ def _lock_users_cart(session: Session, user_id: uuid.UUID, cart_id: uuid.UUID) -
     cart = session.scalar(
         select(Cart)
         .where(Cart.id == cart_id, Cart.user_id == user_id)
+        .options(selectinload(Cart.items).selectinload(CartItem.product))
         .with_for_update()
         .execution_options(populate_existing=True)  # read the locked row, not a cached copy
     )
