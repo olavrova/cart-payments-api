@@ -6,6 +6,7 @@ commits become savepoints inside it, so tests never leave data behind.
 
 import os
 import uuid
+from collections.abc import Sequence
 from decimal import Decimal
 
 import pytest
@@ -57,7 +58,7 @@ class Factory:
     def cart(
         self,
         user: User,
-        items: list[tuple[Product, int]] = (),
+        items: Sequence[tuple[Product, int]] = (),
         status: CartStatus = CartStatus.ACTIVE,
     ) -> Cart:
         cart = Cart(
