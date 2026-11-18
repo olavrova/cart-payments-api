@@ -3,7 +3,7 @@
 import uuid
 from datetime import timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.cart_total import calculate_cart_total
@@ -18,11 +18,11 @@ from app.errors import (
 from app.models import Cart, CartStatus, Payment, PaymentMethod, PaymentStatus
 from app.payment_provider import PaymentProvider, PaymentProviderError
 
-# Far longer than a provider call takes. A pending payment this old was left by a crash.
+# Far longer than a provider call takes. A payment still pending this long after its
+# last attempt was left by a crash, and the next request resumes it.
 STALE_PENDING_AFTER = timedelta(minutes=5)
 
 PROVIDER_ERROR = "provider_error"
-STALE_PENDING = "stale_pending"
 
 
 def start_payment(
@@ -37,28 +37,19 @@ def start_payment(
 
     The returned payment is either succeeded or failed. The pending payment is
     committed before the provider is called, so a crash never loses a charge.
+    A payment left pending by a crash is resumed with its own idempotency key,
+    so the provider never charges the card twice for it.
     """
     cart = _lock_users_cart(session, user_id, cart_id)
-    _ensure_cart_can_be_paid(session, cart)
-    payment_method = _find_payment_method(session, user_id, payment_method_id)
-    total = calculate_cart_total(cart)
-    if total.amount <= 0:
-        raise NothingToPay()
-
-    payment = Payment(
-        id=uuid.uuid4(),
-        cart_id=cart.id,
-        user_id=user_id,
-        payment_method=payment_method,
-        amount=total.amount,
-        currency=total.currency,
+    _ensure_cart_can_be_paid(cart)
+    payment = _resume_stale_payment(session, cart.id) or _new_payment(
+        session, cart, user_id, payment_method_id
     )
-    session.add(payment)
     session.commit()
 
     try:
         result = provider.charge(
-            token=payment_method.provider_token,
+            token=payment.payment_method.provider_token,
             amount=payment.amount,
             currency=payment.currency,
             idempotency_key=str(payment.id),
@@ -88,39 +79,52 @@ def _lock_users_cart(session: Session, user_id: uuid.UUID, cart_id: uuid.UUID) -
     return cart
 
 
-def _ensure_cart_can_be_paid(session: Session, cart: Cart) -> None:
+def _ensure_cart_can_be_paid(cart: Cart) -> None:
     if cart.status != CartStatus.ACTIVE:
         raise CartNotActive()
     if not cart.items:
         raise EmptyCart()
-    _fail_stale_pending_payments(session, cart.id)
-    if _has_active_payment(session, cart.id):
-        raise PaymentInProgress()
 
 
-def _fail_stale_pending_payments(session: Session, cart_id: uuid.UUID) -> None:
-    session.execute(
-        update(Payment)
-        .where(
+def _resume_stale_payment(session: Session, cart_id: uuid.UUID) -> Payment | None:
+    """The cart's pending payment left by a crash, to retry, or None if there is none.
+
+    It keeps its id, amount and card: the provider then answers the first charge
+    again instead of charging twice. A fresh pending or a succeeded payment means
+    a payment is in progress.
+    """
+    row = session.execute(
+        select(Payment, Payment.updated_at < func.now() - STALE_PENDING_AFTER).where(
             Payment.cart_id == cart_id,
-            Payment.status == PaymentStatus.PENDING,
-            Payment.created_at < func.now() - STALE_PENDING_AFTER,
+            Payment.status.in_([PaymentStatus.PENDING, PaymentStatus.SUCCEEDED]),
         )
-        .values(status=PaymentStatus.FAILED, failure_reason=STALE_PENDING)
-    )
+    ).first()
+    if row is None:
+        return None
+    payment, is_stale = row
+    if payment.status != PaymentStatus.PENDING or not is_stale:
+        raise PaymentInProgress()
+    payment.updated_at = func.now()  # this attempt is not stale while it runs
+    return payment
 
 
-def _has_active_payment(session: Session, cart_id: uuid.UUID) -> bool:
-    return session.scalar(
-        select(
-            select(Payment)
-            .where(
-                Payment.cart_id == cart_id,
-                Payment.status.in_([PaymentStatus.PENDING, PaymentStatus.SUCCEEDED]),
-            )
-            .exists()
-        )
+def _new_payment(
+    session: Session, cart: Cart, user_id: uuid.UUID, payment_method_id: uuid.UUID | None
+) -> Payment:
+    payment_method = _find_payment_method(session, user_id, payment_method_id)
+    total = calculate_cart_total(cart)
+    if total.amount <= 0:
+        raise NothingToPay()
+    payment = Payment(
+        id=uuid.uuid4(),
+        cart_id=cart.id,
+        user_id=user_id,
+        payment_method=payment_method,
+        amount=total.amount,
+        currency=total.currency,
     )
+    session.add(payment)
+    return payment
 
 
 def _find_payment_method(

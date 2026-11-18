@@ -6,7 +6,9 @@ import pytest
 from sqlalchemy import select
 
 from app.models import CartStatus, Payment, PaymentStatus
-from app.payments.service import PROVIDER_ERROR, STALE_PENDING
+from app.payment_provider import MockPaymentProvider
+from app.payments.routes import PAYMENT_PROVIDER_KEY
+from app.payments.service import PROVIDER_ERROR
 
 
 @pytest.fixture
@@ -38,7 +40,7 @@ def payments_of(db, cart):
     return db.scalars(select(Payment).where(Payment.cart_id == cart.id)).all()
 
 
-def add_pending_payment(db, cart, card, created_at=None):
+def add_pending_payment(db, cart, card, last_attempt_at=None):
     payment = Payment(
         cart_id=cart.id,
         user_id=cart.user_id,
@@ -46,8 +48,8 @@ def add_pending_payment(db, cart, card, created_at=None):
         amount=Decimal("70.00"),
         currency="USD",
     )
-    if created_at is not None:
-        payment.created_at = created_at
+    if last_attempt_at is not None:
+        payment.created_at = payment.updated_at = last_attempt_at
     db.add(payment)
     db.flush()
     return payment
@@ -154,17 +156,49 @@ def test_payment_in_progress_is_a_conflict(client, db, provider, user, card, car
     assert provider.calls == []
 
 
-def test_stale_pending_payment_is_failed_and_does_not_block_a_new_one(
-    client, db, user, card, cart
+def ten_minutes_ago():
+    return datetime.now(UTC) - timedelta(minutes=10)
+
+
+def test_stale_pending_payment_is_resumed_with_its_own_idempotency_key(
+    client, db, factory, provider, user, card, cart
 ):
-    stale = add_pending_payment(db, cart, card, datetime.now(UTC) - timedelta(minutes=10))
+    stale = add_pending_payment(db, cart, card, last_attempt_at=ten_minutes_ago())
+    other_card = factory.payment_method(user, token="tok_test_other", is_default=False)
+
+    response = pay(client, user, cart.id, json={"payment_method_id": str(other_card.id)})
+
+    assert response.status_code == 201
+    assert response.get_json()["id"] == str(stale.id)
+    assert provider.calls == [
+        {
+            "token": card.provider_token,
+            "amount": Decimal("70.00"),
+            "currency": "USD",
+            "idempotency_key": str(stale.id),
+        }
+    ]
+    [payment] = payments_of(db, cart)
+    assert payment.status == PaymentStatus.SUCCEEDED
+
+
+def test_card_charged_before_a_crash_is_not_charged_again(app, client, db, user, card, cart):
+    mock_provider = MockPaymentProvider()
+    app.extensions[PAYMENT_PROVIDER_KEY] = mock_provider
+    stale = add_pending_payment(db, cart, card, last_attempt_at=ten_minutes_ago())
+    # The provider charged the card, then the app crashed before saving the result.
+    first_charge = mock_provider.charge(
+        token=card.provider_token,
+        amount=stale.amount,
+        currency=stale.currency,
+        idempotency_key=str(stale.id),
+    )
 
     response = pay(client, user, cart.id)
 
     assert response.status_code == 201
-    db.refresh(stale)
-    assert stale.status == PaymentStatus.FAILED
-    assert stale.failure_reason == STALE_PENDING
+    [payment] = payments_of(db, cart)
+    assert payment.provider_payment_id == first_charge.provider_payment_id
 
 
 def test_cart_of_another_user_is_not_found(client, factory, provider, cart):
