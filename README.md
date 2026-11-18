@@ -55,6 +55,13 @@ Tests use the separate `cart_payments_test` database (override with `TEST_DATABA
 Each test runs in a transaction that is rolled back, so tests are independent and leave
 no data behind. The endpoint tests use a fake payment provider that records its calls.
 
+Lint and format check (config in `pyproject.toml`):
+
+```bash
+pip install ruff
+ruff check . && ruff format --check .
+```
+
 **After changing a migration**, recreate the databases (this deletes their data):
 
 ```bash
