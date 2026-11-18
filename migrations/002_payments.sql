@@ -7,13 +7,22 @@
 --   succeeded  — the provider charged the card.
 --   failed     — the provider declined the charge or returned an error.
 
+
+-- Targets for the composite foreign keys below. They let the database check
+-- that a payment's cart and payment method belong to the same user.
+ALTER TABLE carts
+    ADD CONSTRAINT uq_carts_id_user_id UNIQUE (id, user_id);
+ALTER TABLE user_payment_methods
+    ADD CONSTRAINT uq_user_payment_methods_id_user_id UNIQUE (id, user_id);
+
+
 CREATE TABLE payments (
     id                  UUID           PRIMARY KEY DEFAULT gen_random_uuid(),
-    cart_id             UUID           NOT NULL REFERENCES carts(id),
+    cart_id             UUID           NOT NULL,
     user_id             UUID           NOT NULL REFERENCES users(id),
-    payment_method_id   UUID           NOT NULL REFERENCES user_payment_methods(id),
+    payment_method_id   UUID           NOT NULL,
     amount              NUMERIC(12, 2) NOT NULL CHECK (amount > 0),
-    currency            CHAR(3)        NOT NULL,
+    currency            CHAR(3)        NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
     status              TEXT           NOT NULL DEFAULT 'pending'
                                        CHECK (status IN ('pending', 'succeeded', 'failed')),
     provider_payment_id TEXT,
@@ -21,9 +30,17 @@ CREATE TABLE payments (
     created_at          TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
     updated_at          TIMESTAMPTZ    NOT NULL DEFAULT NOW(),
 
-    -- A succeeded payment always has the provider's id; a failed one has a reason.
-    CHECK (status <> 'succeeded' OR provider_payment_id IS NOT NULL),
-    CHECK (status <> 'failed' OR failure_reason IS NOT NULL)
+    -- The cart and the payment method must belong to the paying user.
+    CONSTRAINT fk_payments_cart_user
+        FOREIGN KEY (cart_id, user_id) REFERENCES carts(id, user_id),
+    CONSTRAINT fk_payments_payment_method_user
+        FOREIGN KEY (payment_method_id, user_id) REFERENCES user_payment_methods(id, user_id),
+
+    -- Only a succeeded payment has the provider's id; only a failed one has a reason.
+    CONSTRAINT ck_payments_provider_id_iff_succeeded
+        CHECK ((status = 'succeeded') = (provider_payment_id IS NOT NULL)),
+    CONSTRAINT ck_payments_failure_reason_iff_failed
+        CHECK ((status = 'failed') = (failure_reason IS NOT NULL))
 );
 
 CREATE INDEX idx_payments_cart_id ON payments(cart_id);
@@ -34,3 +51,8 @@ CREATE INDEX idx_payments_user_id ON payments(user_id);
 CREATE UNIQUE INDEX uq_payments_cart_active
     ON payments(cart_id)
     WHERE status IN ('pending', 'succeeded');
+
+-- One provider charge maps to exactly one payment.
+CREATE UNIQUE INDEX uq_payments_provider_payment_id
+    ON payments(provider_payment_id)
+    WHERE provider_payment_id IS NOT NULL;
