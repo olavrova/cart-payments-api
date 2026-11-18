@@ -1,5 +1,6 @@
 """Starting a payment for a cart."""
 
+import logging
 import uuid
 from datetime import timedelta
 
@@ -23,6 +24,8 @@ from app.payment_provider import PaymentProvider, PaymentProviderError
 STALE_PENDING_AFTER = timedelta(minutes=5)
 
 PROVIDER_ERROR = "provider_error"
+
+logger = logging.getLogger(__name__)
 
 
 def start_payment(
@@ -59,11 +62,28 @@ def start_payment(
     else:
         if result.succeeded:
             payment.mark_succeeded(result.provider_payment_id)
-            cart.status = CartStatus.CHECKED_OUT
+            _check_out(_lock_users_cart(session, user_id, cart_id), payment)
         else:
             payment.mark_failed(result.failure_reason)
     session.commit()
     return payment
+
+
+def _check_out(cart: Cart, payment: Payment) -> None:
+    """Mark the paid cart checked out, unless it changed status during the charge.
+
+    The lock was released while the provider was called. The charge is recorded
+    either way, because the money was taken.
+    """
+    if cart.status == CartStatus.ACTIVE:
+        cart.status = CartStatus.CHECKED_OUT
+    else:
+        logger.warning(
+            "Payment %s succeeded but cart %s became %s during the charge; refund needed.",
+            payment.id,
+            cart.id,
+            cart.status,
+        )
 
 
 def _lock_users_cart(session: Session, user_id: uuid.UUID, cart_id: uuid.UUID) -> Cart:
@@ -72,7 +92,10 @@ def _lock_users_cart(session: Session, user_id: uuid.UUID, cart_id: uuid.UUID) -
     Another user's cart gives the same error as a missing one, to not reveal it exists.
     """
     cart = session.scalar(
-        select(Cart).where(Cart.id == cart_id, Cart.user_id == user_id).with_for_update()
+        select(Cart)
+        .where(Cart.id == cart_id, Cart.user_id == user_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)  # read the locked row, not a cached copy
     )
     if cart is None:
         raise CartNotFound()

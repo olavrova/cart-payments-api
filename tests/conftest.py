@@ -6,7 +6,7 @@ commits become savepoints inside it, so tests never leave data behind.
 
 import os
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from decimal import Decimal
 
 import pytest
@@ -25,16 +25,23 @@ TEST_DATABASE_URL = os.environ.get(
 
 
 class FakePaymentProvider:
-    """Records every charge and answers with the outcome the test sets."""
+    """Records every charge and answers with the outcome the test sets.
+
+    during_charge, if set, runs inside the call, to simulate changes made by
+    other requests while the provider is working.
+    """
 
     SUCCEED, DECLINE, ERROR = "succeed", "decline", "error"
 
     def __init__(self):
         self.outcome = self.SUCCEED
         self.calls: list[dict] = []
+        self.during_charge: Callable[[], None] | None = None
 
     def charge(self, **charge_args) -> ChargeResult:
         self.calls.append(charge_args)
+        if self.during_charge is not None:
+            self.during_charge()
         if self.outcome == self.ERROR:
             raise PaymentProviderError("Provider is down.")
         if self.outcome == self.DECLINE:

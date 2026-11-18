@@ -3,9 +3,9 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 
-from app.models import CartStatus, Payment, PaymentStatus
+from app.models import Cart, CartStatus, Payment, PaymentStatus
 from app.payment_provider import MockPaymentProvider
 from app.payments.routes import PAYMENT_PROVIDER_KEY
 from app.payments.service import PROVIDER_ERROR
@@ -127,6 +127,24 @@ def test_provider_error_fails_the_payment_with_bad_gateway(client, db, provider,
     assert payment.status == PaymentStatus.FAILED
     db.refresh(cart)
     assert cart.status == CartStatus.ACTIVE
+
+
+def test_cart_abandoned_during_the_charge_is_not_marked_checked_out(
+    client, db, provider, user, cart, caplog
+):
+    def abandon_cart():
+        db.execute(update(Cart).where(Cart.id == cart.id).values(status=CartStatus.ABANDONED))
+
+    provider.during_charge = abandon_cart
+
+    response = pay(client, user, cart.id)
+
+    assert response.status_code == 201
+    [payment] = payments_of(db, cart)
+    assert payment.status == PaymentStatus.SUCCEEDED
+    db.refresh(cart)
+    assert cart.status == CartStatus.ABANDONED
+    assert "refund needed" in caplog.text
 
 
 def test_paying_a_checked_out_cart_is_a_conflict(client, provider, user, cart):
