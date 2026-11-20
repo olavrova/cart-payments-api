@@ -88,7 +88,7 @@ Charges the user's card for the cart total.
 | `409` | the cart is not `active`, or a payment for it is already in progress | `{"error": "..."}` |
 | `422` | the cart is empty, its total is zero, it mixes currencies, or no usable payment method | `{"error": "..."}` |
 | `502` | the provider failed; nothing was charged, the cart stays `active` | payment, `status: failed` |
-| `502` | the provider could not be asked about a stuck payment; it stays `pending` | `{"error": "..."}` |
+| `502` | the provider could not be asked about a stuck payment, or gave an invalid answer; the payment stays `pending` | `{"error": "..."}` |
 
 Payment body: `id, cart_id, amount (decimal string), currency, status, last_four,
 failure_reason, needs_refund, created_at`. `needs_refund: true` means the card was
@@ -187,7 +187,9 @@ With two files, a migration tool such as Alembic would add more than it gives.
   a user has several cards marked default, the newest one wins.
 - **A10. Provider errors** mean "not charged". A real adapter must map ambiguous
   outcomes such as timeouts to "unknown" and leave the payment `pending` for
-  reconciliation, instead of raising `PaymentProviderError`.
+  reconciliation, instead of raising `PaymentProviderError`. An invalid answer (a
+  success without an id, a decline without a reason) is treated as unknown: the
+  payment stays `pending` and is settled by the stuck-payment lookup (A8).
 
 ## Project layout
 

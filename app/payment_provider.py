@@ -6,6 +6,10 @@ from decimal import Decimal
 from typing import Protocol
 
 
+class InvalidChargeResult(ValueError):
+    """The provider's answer is incomplete, so whether the card was charged is unknown."""
+
+
 @dataclass(frozen=True)
 class ChargeResult:
     """A success has the provider's payment id; a decline has a reason."""
@@ -16,9 +20,9 @@ class ChargeResult:
 
     def __post_init__(self):
         if self.succeeded and not self.provider_payment_id:
-            raise ValueError("A succeeded charge needs a provider_payment_id.")
+            raise InvalidChargeResult("A succeeded charge needs a provider_payment_id.")
         if not self.succeeded and not self.failure_reason:
-            raise ValueError("A declined charge needs a failure_reason.")
+            raise InvalidChargeResult("A declined charge needs a failure_reason.")
 
 
 class PaymentProviderError(Exception):

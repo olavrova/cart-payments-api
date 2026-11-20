@@ -6,7 +6,12 @@ import pytest
 from sqlalchemy import select, update
 
 from app.models import Cart, CartItem, CartStatus, Payment, PaymentStatus
-from app.payment_provider import ChargeResult, MockPaymentProvider
+from app.payment_provider import (
+    ChargeResult,
+    InvalidChargeResult,
+    MockPaymentProvider,
+    PaymentProviderError,
+)
 from app.payments.routes import PAYMENT_PROVIDER_KEY
 from app.payments.service import PROVIDER_ERROR, STALE_PENDING
 
@@ -127,6 +132,35 @@ def test_provider_error_fails_the_payment_with_bad_gateway(client, db, provider,
     assert payment.status == PaymentStatus.FAILED
     db.refresh(cart)
     assert cart.status == CartStatus.ACTIVE
+
+
+def test_invalid_provider_answer_keeps_the_payment_pending_with_bad_gateway(
+    client, db, provider, user, cart
+):
+    provider.outcome = provider.INVALID
+
+    response = pay(client, user, cart.id)
+
+    assert response.status_code == 502
+    assert response.get_json() == {"error": "Payment provider is unavailable. Please try again."}
+    [payment] = payments_of(db, cart)
+    assert payment.status == PaymentStatus.PENDING
+    db.refresh(cart)
+    assert cart.status == CartStatus.ACTIVE
+
+
+def test_invalid_lookup_answer_keeps_the_stale_payment_pending(
+    client, db, provider, user, card, cart
+):
+    provider.lookup_error = InvalidChargeResult("A succeeded charge needs a provider_payment_id.")
+    stale = add_stale_payment(db, provider, cart, card)
+
+    response = pay(client, user, cart.id)
+
+    assert response.status_code == 502
+    assert provider.calls == []
+    db.refresh(stale)
+    assert stale.status == PaymentStatus.PENDING
 
 
 def test_cart_abandoned_during_the_charge_keeps_the_charge_for_a_refund(
@@ -281,7 +315,7 @@ def test_charge_with_another_card_than_chosen_is_refunded_and_the_chosen_card_is
 def test_stale_payment_is_kept_pending_when_the_provider_cannot_be_asked(
     client, db, provider, user, card, cart
 ):
-    provider.lookup_fails = True
+    provider.lookup_error = PaymentProviderError("Provider is down.")
     stale = add_stale_payment(db, provider, cart, card)
 
     response = pay(client, user, cart.id)

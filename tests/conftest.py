@@ -32,13 +32,13 @@ class FakePaymentProvider:
     idempotency key, which find_charge looks up; tests can add to it.
     """
 
-    SUCCEED, DECLINE, ERROR = "succeed", "decline", "error"
+    SUCCEED, DECLINE, ERROR, INVALID = "succeed", "decline", "error", "invalid"
 
     def __init__(self):
         self.outcome = self.SUCCEED
         self.calls: list[dict] = []
         self.charges: dict[str, ChargeResult] = {}
-        self.lookup_fails = False
+        self.lookup_error: Exception | None = None
         self.during_charge: Callable[[], None] | None = None
 
     def charge(self, **charge_args) -> ChargeResult:
@@ -47,6 +47,8 @@ class FakePaymentProvider:
             self.during_charge()
         if self.outcome == self.ERROR:
             raise PaymentProviderError("Provider is down.")
+        if self.outcome == self.INVALID:
+            return ChargeResult(succeeded=True)  # raises InvalidChargeResult
         if self.outcome == self.DECLINE:
             result = ChargeResult(succeeded=False, failure_reason="card_declined")
         else:
@@ -55,8 +57,8 @@ class FakePaymentProvider:
         return result
 
     def find_charge(self, *, idempotency_key: str) -> ChargeResult | None:
-        if self.lookup_fails:
-            raise PaymentProviderError("Provider is down.")
+        if self.lookup_error is not None:
+            raise self.lookup_error
         return self.charges.get(idempotency_key)
 
 

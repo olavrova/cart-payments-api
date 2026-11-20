@@ -3,6 +3,7 @@
 import logging
 import uuid
 from datetime import timedelta
+from typing import NoReturn
 
 from sqlalchemy import func, select, update
 from sqlalchemy.orm import Session, selectinload
@@ -18,7 +19,7 @@ from app.errors import (
     ProviderUnavailable,
 )
 from app.models import Cart, CartItem, CartStatus, Payment, PaymentMethod, PaymentStatus
-from app.payment_provider import PaymentProvider, PaymentProviderError
+from app.payment_provider import InvalidChargeResult, PaymentProvider, PaymentProviderError
 
 # Far longer than a provider call takes. A payment still pending this long after its
 # last attempt was left by a crash, and the next request settles it.
@@ -78,6 +79,8 @@ def start_payment(
         )
     except PaymentProviderError:
         payment.mark_failed(PROVIDER_ERROR)
+    except InvalidChargeResult:
+        _keep_pending(payment)
     else:
         if result.succeeded:
             payment.mark_succeeded(result.provider_payment_id)
@@ -104,6 +107,7 @@ def _settle_earlier_payment(
     A pending payment that is not stale is still in progress. A stale one was
     left by a crash: the provider says whether its charge went through.
     """
+    # The unique index uq_payments_cart_active allows at most one such row.
     row = session.execute(
         select(Payment, Payment.updated_at < func.now() - STALE_PENDING_AFTER).where(
             Payment.cart_id == cart_id,
@@ -135,12 +139,24 @@ def _record_provider_answer(provider: PaymentProvider, payment: Payment) -> None
         result = provider.find_charge(idempotency_key=str(payment.id))
     except PaymentProviderError:
         raise ProviderUnavailable() from None
+    except InvalidChargeResult:
+        _keep_pending(payment)
     if result is None:
         payment.mark_failed(STALE_PENDING)  # the charge never reached the provider
     elif result.succeeded:
         payment.mark_succeeded(result.provider_payment_id)
     else:
         payment.mark_failed(result.failure_reason)
+
+
+def _keep_pending(payment: Payment) -> NoReturn:
+    """Stop on an answer that does not say whether the card was charged.
+
+    The payment stays pending as committed. Once stale, the next attempt asks the
+    provider again, so the card is never charged twice.
+    """
+    logger.exception("Payment %s got an invalid answer from the provider.", payment.id)
+    raise ProviderUnavailable() from None
 
 
 def _pays_for(payment: Payment, total: CartTotal, payment_method_id: uuid.UUID | None) -> bool:
