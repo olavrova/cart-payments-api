@@ -1,12 +1,14 @@
 """Starting a payment for a cart."""
 
+import logging
 import uuid
 from datetime import timedelta
+from typing import NoReturn
 
 from sqlalchemy import func, select, update
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
-from app.cart_total import calculate_cart_total
+from app.cart_total import CartTotal, calculate_cart_total
 from app.errors import (
     CartNotActive,
     CartNotFound,
@@ -14,15 +16,19 @@ from app.errors import (
     NothingToPay,
     PaymentInProgress,
     PaymentMethodNotFound,
+    ProviderUnavailable,
 )
-from app.models import Cart, CartStatus, Payment, PaymentMethod, PaymentStatus
-from app.payment_provider import PaymentProvider, PaymentProviderError
+from app.models import Cart, CartItem, CartStatus, Payment, PaymentMethod, PaymentStatus
+from app.payment_provider import InvalidChargeResult, PaymentProvider, PaymentProviderError
 
-# Far longer than a provider call takes. A pending payment this old was left by a crash.
+# Far longer than a provider call takes. A payment still pending this long after its
+# last attempt was left by a crash, and the next request settles it.
 STALE_PENDING_AFTER = timedelta(minutes=5)
 
 PROVIDER_ERROR = "provider_error"
 STALE_PENDING = "stale_pending"
+
+logger = logging.getLogger(__name__)
 
 
 def start_payment(
@@ -36,14 +42,22 @@ def start_payment(
     """Charge the user's card for the cart and return the payment.
 
     The returned payment is either succeeded or failed. The pending payment is
-    committed before the provider is called, so a crash never loses a charge.
+    committed before the provider is called, so a crash never loses a charge,
+    and a success is committed before the cart is checked out.
     """
     cart = _lock_users_cart(session, user_id, cart_id)
-    _ensure_cart_can_be_paid(session, cart)
+    _ensure_cart_can_be_paid(cart)
     payment_method = _find_payment_method(session, user_id, payment_method_id)
     total = calculate_cart_total(cart)
     if total.amount <= 0:
         raise NothingToPay()
+
+    paid = _settle_earlier_payment(session, provider, cart.id, total, payment_method_id)
+    if paid is not None:
+        _check_out(session, paid)
+        session.commit()
+        return paid
+    session.flush()  # free the cart's unique payment slot before the new payment takes it
 
     payment = Payment(
         id=uuid.uuid4(),
@@ -65,14 +79,113 @@ def start_payment(
         )
     except PaymentProviderError:
         payment.mark_failed(PROVIDER_ERROR)
+    except InvalidChargeResult:
+        _keep_pending(payment)
     else:
         if result.succeeded:
             payment.mark_succeeded(result.provider_payment_id)
-            cart.status = CartStatus.CHECKED_OUT
+            session.commit()  # the money was taken: save it before anything else can fail
+            _check_out(session, payment)
         else:
             payment.mark_failed(result.failure_reason)
     session.commit()
     return payment
+
+
+def _settle_earlier_payment(
+    session: Session,
+    provider: PaymentProvider,
+    cart_id: uuid.UUID,
+    total: CartTotal,
+    payment_method_id: uuid.UUID | None,
+) -> Payment | None:
+    """Finish the cart's earlier payment, if there is one.
+
+    Returns it if it already paid for the cart as it is now; then no new charge
+    is needed. Returns None if a new payment must be made.
+
+    A pending payment that is not stale is still in progress. A stale one was
+    left by a crash: the provider says whether its charge went through.
+    """
+    # The unique index uq_payments_cart_active allows at most one such row.
+    row = session.execute(
+        select(Payment, Payment.updated_at < func.now() - STALE_PENDING_AFTER).where(
+            Payment.cart_id == cart_id,
+            Payment.status.in_([PaymentStatus.PENDING, PaymentStatus.SUCCEEDED]),
+            ~Payment.needs_refund,
+        )
+    ).first()
+    if row is None:
+        return None
+    payment, is_stale = row
+    if payment.status == PaymentStatus.PENDING:
+        if not is_stale:
+            raise PaymentInProgress()
+        _record_provider_answer(provider, payment)
+    if payment.status != PaymentStatus.SUCCEEDED:
+        return None
+    if _pays_for(payment, total, payment_method_id):
+        return payment
+    payment.needs_refund = True
+    logger.warning(
+        "Payment %s paid for an earlier version of cart %s; refund needed.", payment.id, cart_id
+    )
+    return None
+
+
+def _record_provider_answer(provider: PaymentProvider, payment: Payment) -> None:
+    """Save what the provider did with the payment's charge. It never charges the card."""
+    try:
+        result = provider.find_charge(idempotency_key=str(payment.id))
+    except PaymentProviderError:
+        raise ProviderUnavailable() from None
+    except InvalidChargeResult:
+        _keep_pending(payment)
+    if result is None:
+        payment.mark_failed(STALE_PENDING)  # the charge never reached the provider
+    elif result.succeeded:
+        payment.mark_succeeded(result.provider_payment_id)
+    else:
+        payment.mark_failed(result.failure_reason)
+
+
+def _keep_pending(payment: Payment) -> NoReturn:
+    """Stop on an answer that does not say whether the card was charged.
+
+    The payment stays pending as committed. Once stale, the next attempt asks the
+    provider again, so the card is never charged twice.
+    """
+    logger.exception("Payment %s got an invalid answer from the provider.", payment.id)
+    raise ProviderUnavailable() from None
+
+
+def _pays_for(payment: Payment, total: CartTotal, payment_method_id: uuid.UUID | None) -> bool:
+    """Whether the payment charged the cart's current total, with the card the user chose."""
+    return (
+        payment.amount == total.amount
+        and payment.currency == total.currency
+        and payment_method_id in (None, payment.payment_method_id)
+    )
+
+
+def _check_out(session: Session, payment: Payment) -> None:
+    """Mark the paid cart checked out, unless it stopped being active.
+
+    The cart lock was released while the provider was called, so the cart may
+    have been abandoned meanwhile. Then the charge must be refunded.
+    """
+    checked_out = session.execute(
+        update(Cart)
+        .where(Cart.id == payment.cart_id, Cart.status == CartStatus.ACTIVE)
+        .values(status=CartStatus.CHECKED_OUT)
+    ).rowcount
+    if not checked_out:
+        payment.needs_refund = True
+        logger.warning(
+            "Payment %s succeeded but cart %s is no longer active; refund needed.",
+            payment.id,
+            payment.cart_id,
+        )
 
 
 def _lock_users_cart(session: Session, user_id: uuid.UUID, cart_id: uuid.UUID) -> Cart:
@@ -81,46 +194,22 @@ def _lock_users_cart(session: Session, user_id: uuid.UUID, cart_id: uuid.UUID) -
     Another user's cart gives the same error as a missing one, to not reveal it exists.
     """
     cart = session.scalar(
-        select(Cart).where(Cart.id == cart_id, Cart.user_id == user_id).with_for_update()
+        select(Cart)
+        .where(Cart.id == cart_id, Cart.user_id == user_id)
+        .options(selectinload(Cart.items).selectinload(CartItem.product))
+        .with_for_update()
+        .execution_options(populate_existing=True)  # read the locked row, not a cached copy
     )
     if cart is None:
         raise CartNotFound()
     return cart
 
 
-def _ensure_cart_can_be_paid(session: Session, cart: Cart) -> None:
+def _ensure_cart_can_be_paid(cart: Cart) -> None:
     if cart.status != CartStatus.ACTIVE:
         raise CartNotActive()
     if not cart.items:
         raise EmptyCart()
-    _fail_stale_pending_payments(session, cart.id)
-    if _has_active_payment(session, cart.id):
-        raise PaymentInProgress()
-
-
-def _fail_stale_pending_payments(session: Session, cart_id: uuid.UUID) -> None:
-    session.execute(
-        update(Payment)
-        .where(
-            Payment.cart_id == cart_id,
-            Payment.status == PaymentStatus.PENDING,
-            Payment.created_at < func.now() - STALE_PENDING_AFTER,
-        )
-        .values(status=PaymentStatus.FAILED, failure_reason=STALE_PENDING)
-    )
-
-
-def _has_active_payment(session: Session, cart_id: uuid.UUID) -> bool:
-    return session.scalar(
-        select(
-            select(Payment)
-            .where(
-                Payment.cart_id == cart_id,
-                Payment.status.in_([PaymentStatus.PENDING, PaymentStatus.SUCCEEDED]),
-            )
-            .exists()
-        )
-    )
 
 
 def _find_payment_method(

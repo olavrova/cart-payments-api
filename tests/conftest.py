@@ -6,7 +6,7 @@ commits become savepoints inside it, so tests never leave data behind.
 
 import os
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from decimal import Decimal
 
 import pytest
@@ -25,21 +25,41 @@ TEST_DATABASE_URL = os.environ.get(
 
 
 class FakePaymentProvider:
-    """Records every charge and answers with the outcome the test sets."""
+    """Records every charge and answers with the outcome the test sets.
 
-    SUCCEED, DECLINE, ERROR = "succeed", "decline", "error"
+    during_charge, if set, runs inside the call, to simulate changes made by
+    other requests while the provider is working. charges holds the answer per
+    idempotency key, which find_charge looks up; tests can add to it.
+    """
+
+    SUCCEED, DECLINE, ERROR, INVALID = "succeed", "decline", "error", "invalid"
 
     def __init__(self):
         self.outcome = self.SUCCEED
         self.calls: list[dict] = []
+        self.charges: dict[str, ChargeResult] = {}
+        self.lookup_error: Exception | None = None
+        self.during_charge: Callable[[], None] | None = None
 
     def charge(self, **charge_args) -> ChargeResult:
         self.calls.append(charge_args)
+        if self.during_charge is not None:
+            self.during_charge()
         if self.outcome == self.ERROR:
             raise PaymentProviderError("Provider is down.")
+        if self.outcome == self.INVALID:
+            return ChargeResult(succeeded=True)  # raises InvalidChargeResult
         if self.outcome == self.DECLINE:
-            return ChargeResult(succeeded=False, failure_reason="card_declined")
-        return ChargeResult(succeeded=True, provider_payment_id=f"fake_{uuid.uuid4().hex}")
+            result = ChargeResult(succeeded=False, failure_reason="card_declined")
+        else:
+            result = ChargeResult(succeeded=True, provider_payment_id=f"fake_{uuid.uuid4().hex}")
+        self.charges[charge_args["idempotency_key"]] = result
+        return result
+
+    def find_charge(self, *, idempotency_key: str) -> ChargeResult | None:
+        if self.lookup_error is not None:
+            raise self.lookup_error
+        return self.charges.get(idempotency_key)
 
 
 class Factory:
@@ -47,6 +67,7 @@ class Factory:
 
     def __init__(self, session: Session):
         self.session = session
+        self.created: list = []
 
     def user(self) -> User:
         user_id = uuid.uuid4()
@@ -83,6 +104,7 @@ class Factory:
     def _save(self, entity):
         self.session.add(entity)
         self.session.flush()
+        self.created.append(entity)
         return entity
 
 
