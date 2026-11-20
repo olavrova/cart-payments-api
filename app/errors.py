@@ -32,6 +32,11 @@ class PaymentInProgress(ApiError):
     message = "A payment for this cart is already in progress."
 
 
+class ProviderUnavailable(ApiError):
+    status_code = 502
+    message = "Payment provider is unavailable. Please try again."
+
+
 class UnprocessableCart(ApiError):
     status_code = 422
 

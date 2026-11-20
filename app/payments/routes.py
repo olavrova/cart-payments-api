@@ -70,5 +70,6 @@ def _payment_json(payment: Payment) -> dict:
         "status": payment.status,
         "last_four": payment.payment_method.last_four,
         "failure_reason": payment.failure_reason,
+        "needs_refund": payment.needs_refund,
         "created_at": payment.created_at.isoformat(),
     }

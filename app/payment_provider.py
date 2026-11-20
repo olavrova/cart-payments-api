@@ -36,6 +36,13 @@ class PaymentProvider(Protocol):
         """
         ...
 
+    def find_charge(self, *, idempotency_key: str) -> ChargeResult | None:
+        """The answer given for this key, or None if no charge was made with it.
+
+        Only looks the charge up and never charges the card.
+        """
+        ...
+
 
 class MockPaymentProvider:
     """Decides the outcome by the card token, so every outcome is easy to reproduce:
@@ -56,6 +63,9 @@ class MockPaymentProvider:
         if idempotency_key not in self._results:
             self._results[idempotency_key] = self._decide(token)
         return self._results[idempotency_key]
+
+    def find_charge(self, *, idempotency_key: str) -> ChargeResult | None:
+        return self._results.get(idempotency_key)
 
     @staticmethod
     def _decide(token: str) -> ChargeResult:

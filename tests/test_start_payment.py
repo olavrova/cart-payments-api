@@ -5,10 +5,10 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select, update
 
-from app.models import Cart, CartStatus, Payment, PaymentStatus
-from app.payment_provider import MockPaymentProvider
+from app.models import Cart, CartItem, CartStatus, Payment, PaymentStatus
+from app.payment_provider import ChargeResult, MockPaymentProvider
 from app.payments.routes import PAYMENT_PROVIDER_KEY
-from app.payments.service import PROVIDER_ERROR
+from app.payments.service import PROVIDER_ERROR, STALE_PENDING
 
 
 @pytest.fixture
@@ -129,8 +129,8 @@ def test_provider_error_fails_the_payment_with_bad_gateway(client, db, provider,
     assert cart.status == CartStatus.ACTIVE
 
 
-def test_cart_abandoned_during_the_charge_is_not_marked_checked_out(
-    client, db, provider, user, cart, caplog
+def test_cart_abandoned_during_the_charge_keeps_the_charge_for_a_refund(
+    client, db, provider, user, cart
 ):
     def abandon_cart():
         db.execute(update(Cart).where(Cart.id == cart.id).values(status=CartStatus.ABANDONED))
@@ -140,11 +140,28 @@ def test_cart_abandoned_during_the_charge_is_not_marked_checked_out(
     response = pay(client, user, cart.id)
 
     assert response.status_code == 201
+    assert response.get_json()["needs_refund"] is True
     [payment] = payments_of(db, cart)
     assert payment.status == PaymentStatus.SUCCEEDED
+    assert payment.needs_refund
     db.refresh(cart)
     assert cart.status == CartStatus.ABANDONED
-    assert "refund needed" in caplog.text
+
+
+def test_paid_cart_left_active_by_a_crash_is_checked_out_without_charging_again(
+    client, db, provider, user, card, cart
+):
+    paid = add_pending_payment(db, cart, card)
+    paid.mark_succeeded("fake_charged_before_crash")
+    db.flush()
+
+    response = pay(client, user, cart.id)
+
+    assert response.status_code == 201
+    assert response.get_json()["id"] == str(paid.id)
+    assert provider.calls == []
+    db.refresh(cart)
+    assert cart.status == CartStatus.CHECKED_OUT
 
 
 def test_paying_a_checked_out_cart_is_a_conflict(client, provider, user, cart):
@@ -178,33 +195,107 @@ def ten_minutes_ago():
     return datetime.now(UTC) - timedelta(minutes=10)
 
 
-def test_stale_pending_payment_is_resumed_with_its_own_idempotency_key(
+def add_stale_payment(db, provider, cart, card, charge=None):
+    """A pending payment left by a crash. charge is what the provider did with it, if anything."""
+    stale = add_pending_payment(db, cart, card, last_attempt_at=ten_minutes_ago())
+    if charge is not None:
+        provider.charges[str(stale.id)] = charge
+    return stale
+
+
+CHARGED = ChargeResult(succeeded=True, provider_payment_id="fake_charged_before_crash")
+
+
+def test_stale_payment_that_never_reached_the_provider_fails_and_a_new_one_is_charged(
+    client, db, provider, user, card, cart
+):
+    stale = add_stale_payment(db, provider, cart, card)
+
+    response = pay(client, user, cart.id)
+
+    assert response.status_code == 201
+    assert response.get_json()["id"] != str(stale.id)
+    assert [call["idempotency_key"] for call in provider.calls] == [response.get_json()["id"]]
+    db.refresh(stale)
+    assert stale.status == PaymentStatus.FAILED
+    assert stale.failure_reason == STALE_PENDING
+
+
+def test_stale_payment_declined_by_the_provider_fails_and_a_new_one_is_charged(
+    client, db, provider, user, card, cart
+):
+    declined = ChargeResult(succeeded=False, failure_reason="card_declined")
+    stale = add_stale_payment(db, provider, cart, card, charge=declined)
+
+    assert pay(client, user, cart.id).status_code == 201
+    db.refresh(stale)
+    assert stale.failure_reason == "card_declined"
+
+
+def test_card_charged_before_a_crash_is_not_charged_again(client, db, provider, user, card, cart):
+    stale = add_stale_payment(db, provider, cart, card, charge=CHARGED)
+
+    response = pay(client, user, cart.id)
+
+    assert response.status_code == 201
+    assert response.get_json()["id"] == str(stale.id)
+    assert provider.calls == []
+    [payment] = payments_of(db, cart)
+    assert payment.provider_payment_id == CHARGED.provider_payment_id
+    assert not payment.needs_refund
+    db.refresh(cart)
+    assert cart.status == CartStatus.CHECKED_OUT
+
+
+def test_charge_for_an_older_cart_total_is_refunded_and_the_new_total_is_charged(
     client, db, factory, provider, user, card, cart
 ):
-    stale = add_pending_payment(db, cart, card, last_attempt_at=ten_minutes_ago())
+    stale = add_stale_payment(db, provider, cart, card, charge=CHARGED)  # charged 70.00
+    cart.items.append(CartItem(product=factory.product("30.00"), quantity=1, unit_price=30))
+    db.flush()
+
+    response = pay(client, user, cart.id)
+
+    assert response.status_code == 201
+    assert response.get_json()["amount"] == "100.00"
+    assert [call["amount"] for call in provider.calls] == [Decimal("100.00")]
+    db.refresh(stale)
+    assert stale.status == PaymentStatus.SUCCEEDED
+    assert stale.needs_refund
+
+
+def test_charge_with_another_card_than_chosen_is_refunded_and_the_chosen_card_is_charged(
+    client, db, factory, provider, user, card, cart
+):
+    stale = add_stale_payment(db, provider, cart, card, charge=CHARGED)
     other_card = factory.payment_method(user, token="tok_test_other", is_default=False)
 
     response = pay(client, user, cart.id, json={"payment_method_id": str(other_card.id)})
 
     assert response.status_code == 201
-    assert response.get_json()["id"] == str(stale.id)
-    assert provider.calls == [
-        {
-            "token": card.provider_token,
-            "amount": Decimal("70.00"),
-            "currency": "USD",
-            "idempotency_key": str(stale.id),
-        }
-    ]
-    [payment] = payments_of(db, cart)
-    assert payment.status == PaymentStatus.SUCCEEDED
+    assert [call["token"] for call in provider.calls] == ["tok_test_other"]
+    db.refresh(stale)
+    assert stale.needs_refund
 
 
-def test_card_charged_before_a_crash_is_not_charged_again(app, client, db, user, card, cart):
+def test_stale_payment_is_kept_pending_when_the_provider_cannot_be_asked(
+    client, db, provider, user, card, cart
+):
+    provider.lookup_fails = True
+    stale = add_stale_payment(db, provider, cart, card)
+
+    response = pay(client, user, cart.id)
+
+    assert response.status_code == 502
+    assert provider.calls == []
+    db.refresh(stale)
+    assert stale.status == PaymentStatus.PENDING
+
+
+def test_mock_provider_answers_a_lookup_with_its_first_charge(app, client, db, user, card, cart):
     mock_provider = MockPaymentProvider()
     app.extensions[PAYMENT_PROVIDER_KEY] = mock_provider
     stale = add_pending_payment(db, cart, card, last_attempt_at=ten_minutes_ago())
-    # The provider charged the card, then the app crashed before saving the result.
     first_charge = mock_provider.charge(
         token=card.provider_token,
         amount=stale.amount,
@@ -212,9 +303,7 @@ def test_card_charged_before_a_crash_is_not_charged_again(app, client, db, user,
         idempotency_key=str(stale.id),
     )
 
-    response = pay(client, user, cart.id)
-
-    assert response.status_code == 201
+    assert pay(client, user, cart.id).status_code == 201
     [payment] = payments_of(db, cart)
     assert payment.provider_payment_id == first_charge.provider_payment_id
 

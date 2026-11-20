@@ -39,7 +39,7 @@ HTTP/1.1 201 CREATED
 
 {"amount": "70.00", "cart_id": "c1c1c1c1-...", "created_at": "2026-11-18T16:53:59.532174+00:00",
  "currency": "USD", "failure_reason": null, "id": "3d1480bd-...", "last_four": "4242",
- "status": "succeeded"}
+ "needs_refund": false, "status": "succeeded"}
 ```
 
 Running it again returns `409` because the cart is now checked out.
@@ -88,9 +88,11 @@ Charges the user's card for the cart total.
 | `409` | the cart is not `active`, or a payment for it is already in progress | `{"error": "..."}` |
 | `422` | the cart is empty, its total is zero, it mixes currencies, or no usable payment method | `{"error": "..."}` |
 | `502` | the provider failed; nothing was charged, the cart stays `active` | payment, `status: failed` |
+| `502` | the provider could not be asked about a stuck payment; it stays `pending` | `{"error": "..."}` |
 
 Payment body: `id, cart_id, amount (decimal string), currency, status, last_four,
-failure_reason, created_at`.
+failure_reason, needs_refund, created_at`. `needs_refund: true` means the card was
+charged but the cart was not checked out, so the money will be returned.
 
 ### Mock payment provider
 
@@ -121,15 +123,25 @@ curl -i -X POST -H "X-User-Id: 11111111-1111-1111-1111-111111111111" \
 `app/payments/service.py`, `start_payment()`:
 
 1. Load the cart with `SELECT ... FOR UPDATE`. Payments for one cart run one at a time.
-2. Check the cart: it belongs to the user, is `active`, has items, and has no payment
-   in progress.
+2. Check the cart: it belongs to the user, is `active` and has items.
 3. Find the payment method: the given one (it must belong to the user) or the default.
 4. Get the total from the total calculation service (`app/cart_total.py`).
-5. Save the payment as `pending` and **commit before calling the provider**. If the
+5. Settle the cart's earlier payment, if there is one:
+   - `pending` for less than 5 minutes: still in progress → `409`;
+   - `pending` for longer: left by a crash. Ask the provider by idempotency key what
+     happened to it (a lookup that never charges). Not charged → `failed`
+     (`stale_pending`); declined → `failed`.
+   - If it was charged for the cart's current total, with the card the user chose (if
+     any), it pays for the cart: check out and return it without a new charge. If the
+     cart or the card changed since, keep it as `succeeded` with `needs_refund` and go on.
+6. Save the payment as `pending` and **commit before calling the provider**. If the
    process crashes during the call, the attempt is still recorded.
-6. Call the provider with the card token, amount, currency, and the payment id as the
+7. Call the provider with the card token, amount, currency, and the payment id as the
    idempotency key.
-7. Save the outcome: `succeeded` (cart → `checked_out`) or `failed` (cart stays `active`).
+8. Save the outcome: `succeeded` or `failed` (cart stays `active`). A success is
+   committed before the cart is checked out, so it is never lost.
+9. Check out the cart with `UPDATE ... WHERE status = 'active'`. If the cart stopped
+   being active during the charge, the payment gets `needs_refund`.
 
 ## Database schema
 
@@ -139,11 +151,12 @@ payment attempt.
 
 | Rule | How the database enforces it |
 |------|------------------------------|
-| A cart is paid at most once, even with concurrent requests | partial unique index on `cart_id` where status is `pending` or `succeeded` |
+| A cart is paid at most once, even with concurrent requests | partial unique index on `cart_id` where status is `pending` or `succeeded` and not `needs_refund` |
 | Failed attempts are kept and do not block a retry | the unique index ignores `failed` rows |
 | The cart and the card belong to the paying user | composite foreign keys `(cart_id, user_id)` and `(payment_method_id, user_id)` |
 | Only a succeeded payment has a provider id; only a failed one has a reason | two-way `CHECK` constraints |
 | One provider charge maps to one payment | unique index on `provider_payment_id` |
+| Only money that was taken is refunded | `needs_refund` only on `succeeded` rows (`CHECK`) |
 | The charged amount is fixed at payment time | `amount` and `currency` stored on the row, like `cart_items.unit_price` |
 | Money is exact | `NUMERIC(12, 2)` in SQL, `Decimal` in Python |
 
@@ -161,13 +174,15 @@ With two files, a migration tool such as Alembic would add more than it gives.
 - **A4. Stock** reservation belongs to order fulfilment and is out of scope.
 - **A5. Retries.** A failed attempt is kept; the cart stays `active` so the user can pay
   again, with the same or another card.
-- **A6. Out of scope:** refunds, partial payments, order creation.
+- **A6. Out of scope:** making refunds, partial payments, order creation. A charge that
+  must be refunded is stored with `needs_refund = true`, for a refund process to pick up.
 - **A7. Two decimal places** for amounts, like the base schema. Currencies with 0 or 3
   minor digits (JPY, KWD) would need integer minor units.
 - **A8. Stuck payments.** A `pending` payment older than 5 minutes was left by a crash.
-  The next attempt marks it `failed` (`stale_pending`) so the cart is not blocked
-  forever. A real system would first check with the provider, by idempotency key,
-  that the card was not charged.
+  The next attempt asks the provider about it by idempotency key
+  (`PaymentProvider.find_charge`), so a card charged before the crash is never charged
+  twice. If the provider can't be reached, the request returns `502` and the payment
+  stays `pending`.
 - **A9. Default card.** Without `payment_method_id`, the user's default card is used. If
   a user has several cards marked default, the newest one wins.
 - **A10. Provider errors** mean "not charged". A real adapter must map ambiguous

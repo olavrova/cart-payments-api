@@ -40,6 +40,14 @@ def test_same_idempotency_key_returns_the_first_answer_without_charging_again():
     assert again == first
 
 
+def test_find_charge_returns_the_answer_for_the_key_without_charging():
+    provider = MockPaymentProvider()
+    first = charge("tok_a", provider, idempotency_key="payment-1")
+
+    assert provider.find_charge(idempotency_key="payment-1") == first
+    assert provider.find_charge(idempotency_key="payment-2") is None
+
+
 def test_charge_is_declined_when_token_contains_decline():
     result = charge("tok_decline_visa")
 

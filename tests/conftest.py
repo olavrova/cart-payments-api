@@ -28,7 +28,8 @@ class FakePaymentProvider:
     """Records every charge and answers with the outcome the test sets.
 
     during_charge, if set, runs inside the call, to simulate changes made by
-    other requests while the provider is working.
+    other requests while the provider is working. charges holds the answer per
+    idempotency key, which find_charge looks up; tests can add to it.
     """
 
     SUCCEED, DECLINE, ERROR = "succeed", "decline", "error"
@@ -36,6 +37,8 @@ class FakePaymentProvider:
     def __init__(self):
         self.outcome = self.SUCCEED
         self.calls: list[dict] = []
+        self.charges: dict[str, ChargeResult] = {}
+        self.lookup_fails = False
         self.during_charge: Callable[[], None] | None = None
 
     def charge(self, **charge_args) -> ChargeResult:
@@ -45,8 +48,16 @@ class FakePaymentProvider:
         if self.outcome == self.ERROR:
             raise PaymentProviderError("Provider is down.")
         if self.outcome == self.DECLINE:
-            return ChargeResult(succeeded=False, failure_reason="card_declined")
-        return ChargeResult(succeeded=True, provider_payment_id=f"fake_{uuid.uuid4().hex}")
+            result = ChargeResult(succeeded=False, failure_reason="card_declined")
+        else:
+            result = ChargeResult(succeeded=True, provider_payment_id=f"fake_{uuid.uuid4().hex}")
+        self.charges[charge_args["idempotency_key"]] = result
+        return result
+
+    def find_charge(self, *, idempotency_key: str) -> ChargeResult | None:
+        if self.lookup_fails:
+            raise PaymentProviderError("Provider is down.")
+        return self.charges.get(idempotency_key)
 
 
 class Factory:
