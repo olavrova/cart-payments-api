@@ -3,13 +3,18 @@ from decimal import Decimal
 
 import pytest
 
-from app.payment_provider import ChargeResult, MockPaymentProvider, PaymentProviderError
+from app.payment_provider import (
+    ChargeResult,
+    IdempotencyKeyReused,
+    MockPaymentProvider,
+    PaymentProviderError,
+)
 
 
-def charge(token: str, provider=None, idempotency_key=None):
+def charge(token: str, provider=None, idempotency_key=None, amount="10.00"):
     return (provider or MockPaymentProvider()).charge(
         token=token,
-        amount=Decimal("10.00"),
+        amount=Decimal(amount),
         currency="USD",
         idempotency_key=idempotency_key or str(uuid.uuid4()),
     )
@@ -38,6 +43,24 @@ def test_same_idempotency_key_returns_the_first_answer_without_charging_again():
     again = charge("tok_a", provider, idempotency_key="payment-1")
 
     assert again == first
+
+
+@pytest.mark.parametrize(("token", "amount"), [("tok_b", "10.00"), ("tok_a", "99.00")])
+def test_key_reused_with_other_charge_details_is_rejected(token, amount):
+    provider = MockPaymentProvider()
+    charge("tok_a", provider, idempotency_key="payment-1", amount="10.00")
+
+    with pytest.raises(IdempotencyKeyReused):
+        charge(token, provider, idempotency_key="payment-1", amount=amount)
+
+
+def test_oldest_keys_are_forgotten_after_max_keys():
+    provider = MockPaymentProvider(max_keys=2)
+    for key in ["payment-1", "payment-2", "payment-3"]:
+        charge("tok_a", provider, idempotency_key=key)
+
+    assert provider.find_charge(idempotency_key="payment-1") is None
+    assert provider.find_charge(idempotency_key="payment-3") is not None
 
 
 def test_find_charge_returns_the_answer_for_the_key_without_charging():

@@ -54,6 +54,8 @@ pytest
 Tests use the separate `cart_payments_test` database (override with `TEST_DATABASE_URL`).
 Each test runs in a transaction that is rolled back, so tests are independent and leave
 no data behind. The endpoint tests use a fake payment provider that records its calls.
+`tests/test_concurrent_requests.py` is the exception: it checks a race between two
+requests on separate connections, so it commits its data and deletes it afterwards.
 
 Lint and format check (config in `pyproject.toml`):
 
@@ -103,6 +105,10 @@ charged but the cart was not checked out, so the money will be returned.
 | `decline` | declined, `failure_reason: "card_declined"` → `402` |
 | `error` | provider failure, `failure_reason: "provider_error"` → `502` |
 | anything else | success |
+
+Like a real provider, it answers the same idempotency key with the first answer, and
+rejects a key reused with another card, amount or currency (`IdempotencyKeyReused`).
+It keeps the newest 10,000 keys, so its memory stays bounded.
 
 To try a decline by hand, add a card for Alice and pay with it:
 

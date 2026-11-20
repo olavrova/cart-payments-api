@@ -3,9 +3,9 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import select
 
-from app.models import Cart, CartItem, CartStatus, Payment, PaymentStatus
+from app.models import CartItem, CartStatus, Payment, PaymentStatus
 from app.payment_provider import (
     ChargeResult,
     InvalidChargeResult,
@@ -161,25 +161,6 @@ def test_invalid_lookup_answer_keeps_the_stale_payment_pending(
     assert provider.calls == []
     db.refresh(stale)
     assert stale.status == PaymentStatus.PENDING
-
-
-def test_cart_abandoned_during_the_charge_keeps_the_charge_for_a_refund(
-    client, db, provider, user, cart
-):
-    def abandon_cart():
-        db.execute(update(Cart).where(Cart.id == cart.id).values(status=CartStatus.ABANDONED))
-
-    provider.during_charge = abandon_cart
-
-    response = pay(client, user, cart.id)
-
-    assert response.status_code == 201
-    assert response.get_json()["needs_refund"] is True
-    [payment] = payments_of(db, cart)
-    assert payment.status == PaymentStatus.SUCCEEDED
-    assert payment.needs_refund
-    db.refresh(cart)
-    assert cart.status == CartStatus.ABANDONED
 
 
 def test_paid_cart_left_active_by_a_crash_is_checked_out_without_charging_again(

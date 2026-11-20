@@ -1,6 +1,8 @@
 """The external payment provider: an interface and a mock implementation."""
 
+import threading
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Protocol
@@ -48,6 +50,15 @@ class PaymentProvider(Protocol):
         ...
 
 
+class IdempotencyKeyReused(Exception):
+    """A key was sent again with another card, amount or currency. Nothing was charged.
+
+    Real providers reject such a request, because it is a bug in the caller. It is
+    not a PaymentProviderError: whether the key's first charge went through is
+    unknown to the caller, so the payment must not be marked failed.
+    """
+
+
 class MockPaymentProvider:
     """Decides the outcome by the card token, so every outcome is easy to reproduce:
 
@@ -55,21 +66,36 @@ class MockPaymentProvider:
     - token contains "error"   -> the provider fails (PaymentProviderError);
     - any other token          -> the charge succeeds.
 
-    Answers are remembered per idempotency key for the life of the process.
+    Like a real provider, it remembers the answer per idempotency key, rejects a
+    key reused with other charge details, and forgets the oldest keys after
+    max_keys, so memory stays bounded. Safe to use from several threads.
     """
 
-    def __init__(self):
-        self._results: dict[str, ChargeResult] = {}
+    def __init__(self, max_keys: int = 10_000):
+        self._max_keys = max_keys
+        self._charges: OrderedDict[str, tuple[tuple, ChargeResult]] = OrderedDict()
+        self._lock = threading.Lock()
 
     def charge(
         self, *, token: str, amount: Decimal, currency: str, idempotency_key: str
     ) -> ChargeResult:
-        if idempotency_key not in self._results:
-            self._results[idempotency_key] = self._decide(token)
-        return self._results[idempotency_key]
+        details = (token, amount, currency)
+        with self._lock:
+            if idempotency_key in self._charges:
+                first_details, result = self._charges[idempotency_key]
+                if details != first_details:
+                    raise IdempotencyKeyReused(idempotency_key)
+                return result
+            result = self._decide(token)
+            self._charges[idempotency_key] = (details, result)
+            if len(self._charges) > self._max_keys:
+                self._charges.popitem(last=False)
+            return result
 
     def find_charge(self, *, idempotency_key: str) -> ChargeResult | None:
-        return self._results.get(idempotency_key)
+        with self._lock:
+            charge = self._charges.get(idempotency_key)
+        return None if charge is None else charge[1]
 
     @staticmethod
     def _decide(token: str) -> ChargeResult:

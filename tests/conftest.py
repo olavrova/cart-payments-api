@@ -67,6 +67,7 @@ class Factory:
 
     def __init__(self, session: Session):
         self.session = session
+        self.created: list = []
 
     def user(self) -> User:
         user_id = uuid.uuid4()
@@ -103,6 +104,7 @@ class Factory:
     def _save(self, entity):
         self.session.add(entity)
         self.session.flush()
+        self.created.append(entity)
         return entity
 
 
