@@ -60,7 +60,6 @@ requests on separate connections, so it commits its data and deletes it afterwar
 Lint and format check (config in `pyproject.toml`):
 
 ```bash
-pip install ruff
 ruff check . && ruff format --check .
 ```
 
