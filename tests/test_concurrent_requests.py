@@ -69,4 +69,4 @@ def test_cart_abandoned_by_another_request_during_the_charge_is_kept_for_a_refun
         payment = check.scalars(select(Payment).where(Payment.cart_id == cart.id)).one()
         assert payment.status == PaymentStatus.SUCCEEDED
         assert payment.needs_refund
-        assert check.get(Cart, cart.id).status == CartStatus.ABANDONED
+        assert check.get_one(Cart, cart.id).status == CartStatus.ABANDONED

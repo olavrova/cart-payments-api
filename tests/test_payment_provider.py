@@ -24,6 +24,7 @@ def test_charge_succeeds_with_a_regular_token():
     result = charge("tok_test_visa")
 
     assert result.succeeded
+    assert result.provider_payment_id is not None
     assert result.provider_payment_id.startswith("mock_")
     assert result.failure_reason is None
 

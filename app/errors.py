@@ -64,4 +64,4 @@ def register_error_handlers(app: Flask) -> None:
 
     @app.errorhandler(HTTPException)
     def handle_http_exception(error: HTTPException):
-        return jsonify(error=error.description), error.code
+        return jsonify(error=error.description), error.code or 500

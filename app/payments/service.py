@@ -19,7 +19,12 @@ from app.errors import (
     ProviderUnavailable,
 )
 from app.models import Cart, CartItem, CartStatus, Payment, PaymentMethod, PaymentStatus
-from app.payment_provider import InvalidChargeResult, PaymentProvider, PaymentProviderError
+from app.payment_provider import (
+    ChargeResult,
+    InvalidChargeResult,
+    PaymentProvider,
+    PaymentProviderError,
+)
 
 # Far longer than a provider call takes. A payment still pending this long after its
 # last attempt was left by a crash, and the next request settles it.
@@ -82,12 +87,10 @@ def start_payment(
     except InvalidChargeResult:
         _keep_pending(payment)
     else:
-        if result.succeeded:
-            payment.mark_succeeded(result.provider_payment_id)
+        _record_charge_result(payment, result)
+        if payment.status == PaymentStatus.SUCCEEDED:
             session.commit()  # the money was taken: save it before anything else can fail
             _check_out(session, payment)
-        else:
-            payment.mark_failed(result.failure_reason)
     session.commit()
     return payment
 
@@ -143,9 +146,18 @@ def _record_provider_answer(provider: PaymentProvider, payment: Payment) -> None
         _keep_pending(payment)
     if result is None:
         payment.mark_failed(STALE_PENDING)  # the charge never reached the provider
-    elif result.succeeded:
+    else:
+        _record_charge_result(payment, result)
+
+
+def _record_charge_result(payment: Payment, result: ChargeResult) -> None:
+    # ChargeResult rejects a success without an id and a decline without a reason,
+    # so the asserts only tell the type checker what is already guaranteed.
+    if result.succeeded:
+        assert result.provider_payment_id is not None
         payment.mark_succeeded(result.provider_payment_id)
     else:
+        assert result.failure_reason is not None
         payment.mark_failed(result.failure_reason)
 
 
@@ -174,12 +186,13 @@ def _check_out(session: Session, payment: Payment) -> None:
     The cart lock was released while the provider was called, so the cart may
     have been abandoned meanwhile. Then the charge must be refunded.
     """
-    checked_out = session.execute(
+    checked_out_id = session.scalar(
         update(Cart)
         .where(Cart.id == payment.cart_id, Cart.status == CartStatus.ACTIVE)
         .values(status=CartStatus.CHECKED_OUT)
-    ).rowcount
-    if not checked_out:
+        .returning(Cart.id)
+    )
+    if checked_out_id is None:
         payment.needs_refund = True
         logger.warning(
             "Payment %s succeeded but cart %s is no longer active; refund needed.",
