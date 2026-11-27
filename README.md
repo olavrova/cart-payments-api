@@ -44,6 +44,8 @@ HTTP/1.1 201 CREATED
 
 Running it again returns `409` because the cart is now checked out.
 
+Or try it in the browser: Swagger UI at http://localhost:5000/docs.
+
 ## Running the tests
 
 ```bash
@@ -70,6 +72,11 @@ docker compose down -v && docker compose up -d --wait
 ```
 
 ## API
+
+The OpenAPI spec is `app/docs/openapi.yaml`, served at `/openapi.yaml` and shown by
+Swagger UI at `/docs` (loaded from the unpkg CDN, so the page needs internet access).
+The spec is written by hand; `tests/test_openapi.py` fails if its routes, status codes
+or payment fields differ from the app's.
 
 ### `POST /carts/<cart_id>/payments`
 
@@ -207,6 +214,7 @@ app/
 ├── errors.py            API errors and their HTTP status codes
 ├── payment_provider.py  provider interface and the mock
 ├── cart_total.py        stand-in for the total calculation service
+├── docs/                openapi.yaml and the Swagger UI page, served at /docs
 └── payments/
     ├── routes.py        HTTP layer: parse request, call service, build response
     └── service.py       start_payment(): the payment flow

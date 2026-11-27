@@ -1,0 +1,133 @@
+openapi: 3.0.3
+info:
+  title: Cart Payments API
+  version: 1.0.0
+  description: |
+    The payment part of an online shop. See README.md for the payment flow and
+    the assumptions (A1–A10).
+
+    Try it with the sample user Alice (`11111111-1111-1111-1111-111111111111`)
+    and her cart `c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1`.
+servers:
+  - url: /
+paths:
+  /carts/{cart_id}/payments:
+    post:
+      summary: Pay for a cart
+      description: |
+        Charges the user's card for the cart total. On success the cart is
+        checked out. A failed attempt is kept and the user can retry.
+      operationId: createPayment
+      parameters:
+        - name: cart_id
+          in: path
+          required: true
+          schema: {type: string, format: uuid}
+          example: c1c1c1c1-c1c1-c1c1-c1c1-c1c1c1c1c1c1
+        - name: X-User-Id
+          in: header
+          required: true
+          description: UUID of the authenticated user (assumption A1).
+          schema: {type: string, format: uuid}
+          example: 11111111-1111-1111-1111-111111111111
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                payment_method_id:
+                  type: string
+                  format: uuid
+                  description: The card to use. Default is the user's default card.
+      responses:
+        "201":
+          description: The card was charged; the cart is now `checked_out`.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Payment"}
+        "400":
+          description: Missing or malformed `X-User-Id`, cart id, `payment_method_id`, or body.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "402":
+          description: >-
+            The provider declined the card. The payment is `failed`; the cart stays
+            `active` and the user can retry.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Payment"}
+        "404":
+          description: The cart does not exist or belongs to another user.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "409":
+          description: The cart is not `active`, or a payment for it is already in progress.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "422":
+          description: >-
+            The cart is empty, its total is zero, it mixes currencies, or there is no
+            usable payment method.
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/Error"}
+        "502":
+          description: |
+            One of two cases:
+            - The provider failed: a `Payment` with `status: failed`; nothing was
+              charged and the cart stays `active`.
+            - The provider could not be asked about a stuck payment, or gave an
+              invalid answer: an `Error`; the payment stays `pending`.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - {$ref: "#/components/schemas/Payment"}
+                  - {$ref: "#/components/schemas/Error"}
+components:
+  schemas:
+    Payment:
+      type: object
+      required:
+        - id
+        - cart_id
+        - amount
+        - currency
+        - status
+        - last_four
+        - failure_reason
+        - needs_refund
+        - created_at
+      properties:
+        id: {type: string, format: uuid}
+        cart_id: {type: string, format: uuid}
+        amount:
+          type: string
+          description: Exact decimal amount, as a string to avoid float rounding.
+          example: "70.00"
+        currency: {type: string, example: USD}
+        status:
+          type: string
+          enum: [pending, succeeded, failed]
+        last_four: {type: string, example: "4242"}
+        failure_reason:
+          type: string
+          nullable: true
+          description: Set only when `status` is `failed`.
+          example: card_declined
+        needs_refund:
+          type: boolean
+          description: >-
+            The card was charged but the cart was not checked out, so the money
+            will be returned.
+        created_at: {type: string, format: date-time}
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: {type: string, example: Cart not found.}
